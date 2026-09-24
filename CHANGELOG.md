@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Every write path failed on himalaya v2.** v2 removed templates and MML, renamed options, and made `message read --json` a MIME tree. `compose_email`, `send_email`, `draft_reply`, `read_email`, `read_email_html`, `read_email_raw`, `flag_email`, `move_email` and the attachment tools still built v1 command lines. Each now has a v2 branch:
+  - **Composing:** messages are built by the server (nodemailer's MailComposer), then handed to `message send --save sent` or `message add`. This is the external-composer pattern the v2 docs recommend.
+  - **Reading:** bodies are decoded from `message read --raw` (postal-mime), so a quoted-printable reply reads as text.
+  - **Reply-all:** v2 has no `--all`, so the cc list is computed from the original (To + Cc, minus the account and the reply target).
+  - **Flags:** v2 takes `--flag` per flag, only for seen, answered, flagged and draft.
+  - **Moves:** the source goes to `--from`, never `--mailbox`.
+  - **Attachments:** `--dir`.
+  v1 behaviour is unchanged.
+- **`listAccounts` sent v2's `--json` to v1**, which rejects it. It now probes the version first.
+- **A missing binary surfaced as `himalaya_version_undetected`.** The version probe runs before every command, so it is where a missing binary shows first; it now reports `himalaya_not_installed`.
+- **`sendTemplate` left its timeout armed after every send.** Sending now goes through one stdin helper that clears it, and never retries, because a send or append that failed after the server acted would duplicate the message.
+
+### Added
+
+- **`compose_email save_draft`** (himalaya v2). It saves the message, attachments included, to the drafts mailbox (`drafts_folder` to override) with `\Draft` and `\Seen` set on the APPEND itself. Some servers (OVH's Dovecot) refuse a later `STORE` of `\Draft`.
+
 ## [2.1.2] - 2026-08-17
 
 CI and build reliability. No runtime behavior changes — `src/cli/doctor.ts` is a maintainer

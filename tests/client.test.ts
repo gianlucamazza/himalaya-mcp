@@ -343,8 +343,8 @@ describe("HimalayaClient", () => {
       );
     });
 
-    it("readMessageHtml uses message export instead of removed --html flag", async () => {
-      setupMock("");
+    it("readMessageHtml uses message export instead of removed --html flag (v1)", async () => {
+      configureMock({ version: V1_VERSION_STDOUT, stdout: "" });
       vi.mocked(fs.mkdtempSync).mockReturnValue("/tmp/himalaya-mcp-html-test");
       vi.mocked(fs.readFileSync).mockReturnValue("<p>Test HTML content</p>");
       vi.mocked(fs.rmSync).mockImplementation(() => {});
@@ -390,20 +390,13 @@ describe("HimalayaClient", () => {
   });
 
   describe("sendTemplate dual-syntax (spawn path, not exec())", () => {
-    it("passes --json flag on himalaya v2", async () => {
+    it("refuses on himalaya v2, which has no templates", async () => {
       configureMock({ version: V2_VERSION_STDOUT });
       mockSpawn.mockImplementation(() => fakeChildProcess(0, "ok"));
       const client = new HimalayaClient();
 
-      await client.sendTemplate("From: a@b.com\n\nhi");
-
-      expect(mockSpawn).toHaveBeenCalledWith(
-        "himalaya",
-        expect.arrayContaining(["template", "send", "--json"]),
-        expect.any(Object),
-      );
-      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-      expect(spawnArgs).not.toContain("--output");
+      await expect(client.sendTemplate("From: a@b.com\n\nhi")).rejects.toThrow(/no templates/);
+      expect(mockSpawn).not.toHaveBeenCalled();
     });
 
     it("passes --output json flag on himalaya v1.x", async () => {

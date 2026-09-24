@@ -11,6 +11,8 @@ import { promisify } from "node:util";
 import type { HimalayaClientOptions } from "./types.js";
 import { classifyStderr, HimalayaError, unsupportedBackendError } from "./errors.js";
 import { resolveFromAddress } from "./config-toml.js";
+import { NodeHtmlMarkdown } from "node-html-markdown";
+import { parseMessage } from "./message.js";
 import { detectHimalayaVersion, type HimalayaVersion } from "./cli-version.js";
 import { isImapAccount, listAccounts } from "./accounts.js";
 
@@ -19,6 +21,9 @@ const execFileAsync = promisify(execFile);
 // himalaya uses Clap, so any argv that starts with "-" is parsed as a flag.
 // Reject those for user-provided values to prevent flag smuggling
 // (e.g. query="--config /tmp/evil.toml" or target_folder="--help").
+/** The only flags himalaya v2's shared `flag` command accepts. */
+const V2_FLAGS = new Set(["seen", "answered", "flagged", "draft"]);
+
 function assertSafeArg(value: string, field: string): void {
   if (value.startsWith("-")) {
     throw new Error(
@@ -252,6 +257,14 @@ export class HimalayaClient {
   /** Read a message body (plain text). */
   async readMessage(id: string, folder?: string, account?: string): Promise<string> {
     assertSafeArg(id, "id");
+    if ((await this.resolveVersion()).major >= 2) {
+      // v2's `message read --json` is mail-parser's MIME tree, not a body:
+      // decode the raw message and return the text part, JSON-encoded like
+      // v1's output so parseMessageBody reads both.
+      const email = await parseMessage(await this.readRawMessage(id, folder, account));
+      const text = email.text ?? (email.html ? NodeHtmlMarkdown.translate(email.html) : "");
+      return JSON.stringify(text);
+    }
     const args = ["message", "read", id];
     const f = await this.applyFolderArg(args, folder);
     return this.exec(args, { folder: f, account });
@@ -262,9 +275,14 @@ export class HimalayaClient {
    * himalaya v1.2.0 removed the --html flag from `message read`.
    * Instead, use `message export` (without --full) which exports
    * MIME parts as separate files: index.html for HTML, plain.txt for text.
+   * v2 has no export: the HTML part is decoded from the raw message.
    */
   async readMessageHtml(id: string, folder?: string, account?: string): Promise<string> {
     assertSafeArg(id, "id");
+    if ((await this.resolveVersion()).major >= 2) {
+      const email = await parseMessage(await this.readRawMessage(id, folder, account));
+      return JSON.stringify(email.html ?? "");
+    }
     const tmpDir = mkdtempSync(join(tmpdir(), "himalaya-mcp-html-"));
     try {
       const args = ["message", "export"];
@@ -274,6 +292,28 @@ export class HimalayaClient {
       await this.exec(args, { folder: f, account });
       const htmlPath = join(tmpDir, "index.html");
       return readFileSync(htmlPath, "utf-8");
+    } finally {
+      try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
+    }
+  }
+
+  /** Read the full raw RFC 5322 source of a message. */
+  async readRawMessage(id: string, folder?: string, account?: string): Promise<string> {
+    assertSafeArg(id, "id");
+    if ((await this.resolveVersion()).major >= 2) {
+      const args = ["message", "read", id, "--raw"];
+      const f = await this.applyFolderArg(args, folder);
+      const stdout = await this.exec(args, { folder: f, account });
+      return (JSON.parse(stdout) as { message: string }).message;
+    }
+    const tmpDir = mkdtempSync(join(tmpdir(), "himalaya-mcp-raw-"));
+    try {
+      const emlPath = join(tmpDir, `${id}.eml`);
+      const args = ["message", "export", "--full", "--destination", emlPath];
+      const f = await this.applyFolderArg(args, folder);
+      args.push(id);
+      await this.exec(args, { folder: f, account });
+      return readFileSync(emlPath, "utf-8");
     } finally {
       try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
     }
@@ -291,6 +331,19 @@ export class HimalayaClient {
     for (const flag of flags) {
       assertSafeArg(flag, "flag");
     }
+    if ((await this.resolveVersion()).major >= 2) {
+      // v2 takes `--flag` per flag and only the four shared flags.
+      const args = ["flag", action];
+      for (const flag of flags) {
+        const name = flag.toLowerCase().replace(/^\\/, "");
+        if (!V2_FLAGS.has(name)) {
+          throw new Error(`Flag "${flag}" is not supported by himalaya v2 (use one of: ${[...V2_FLAGS].join(", ")})`);
+        }
+        args.push("--flag", name);
+      }
+      const f = await this.applyFolderArg(args, folder);
+      return this.exec(args, { folder: f, account, trailingArgs: [id] });
+    }
     const args = ["flag", action, id, ...flags];
     const f = await this.applyFolderArg(args, folder);
     return this.exec(args, { folder: f, account });
@@ -305,6 +358,16 @@ export class HimalayaClient {
   ): Promise<string> {
     assertSafeArg(id, "id");
     assertSafeArg(targetFolder, "target_folder");
+    if ((await this.resolveVersion()).major >= 2) {
+      // v2: `-f` is --from, not the folder; the source goes there.
+      const args = ["message", "move", "--to", targetFolder];
+      const from = folder || this.opts.folder;
+      if (from) {
+        assertSafeArg(from, "folder");
+        args.push("--from", from);
+      }
+      return this.exec(args, { account, trailingArgs: [id] });
+    }
     const args = ["message", "move", targetFolder, id];
     const f = await this.applyFolderArg(args, folder);
     return this.exec(args, { folder: f, account });
@@ -332,6 +395,34 @@ export class HimalayaClient {
   }
 
   /**
+   * Build a reply with himalaya v2 and return it as raw RFC 5322.
+   *
+   * v2 has no templates: `message reply` prints the composed reply (with
+   * In-Reply-To, References and the quoted original) and never sends
+   * without --send. Reply-all is the caller's cc list, v2 having no --all.
+   */
+  async replyRaw(
+    id: string,
+    body: string | undefined,
+    cc: string[],
+    folder?: string,
+    account?: string,
+  ): Promise<string> {
+    assertSafeArg(id, "id");
+    const args = ["message", "reply", id];
+    if (body) {
+      assertSafeArg(body, "body");
+      args.push("--body", body);
+    }
+    for (const address of cc) {
+      assertSafeArg(address, "cc");
+      args.push("--cc", address);
+    }
+    const f = await this.applyFolderArg(args, folder);
+    return this.exec(args, { folder: f, account });
+  }
+
+  /**
    * Send a template (MML format) via stdin.
    * Uses spawn() with an args array — no shell involved, safe for multiline templates.
    * Positional-arg approach breaks for multiline MML; stdin is the correct path.
@@ -349,42 +440,80 @@ export class HimalayaClient {
     }
 
     const version = await this.resolveVersion();
-    const args = version.major >= 2 ? ["template", "send", "--json"] : ["template", "send", "--output", "json"];
+    if (version.major >= 2) {
+      throw new Error("himalaya v2 has no templates: send a raw message with sendRaw()");
+    }
+    return this.pipeStdin(["template", "send", "--output", "json"], template, account);
+  }
+
+  /**
+   * Send a raw RFC 5322 message (himalaya v2), optionally saving a copy.
+   * v2 keeps no sent copy on its own: pass the sent mailbox (or its alias).
+   */
+  async sendRaw(raw: string, save: string | undefined, account?: string): Promise<string> {
+    const args = ["message", "send", "--json"];
+    if (save) {
+      assertSafeArg(save, "save");
+      args.push("--save", save);
+    }
+    return this.pipeStdin(args, raw, account);
+  }
+
+  /**
+   * Append a raw RFC 5322 message to a mailbox (himalaya v2) with its flags
+   * set on the APPEND itself, returning the new id. Setting them in the
+   * same command matters: some servers refuse a later STORE of \Draft.
+   */
+  async addRaw(raw: string, mailbox: string, flags: string[], account?: string): Promise<string> {
+    assertSafeArg(mailbox, "mailbox");
+    const args = ["message", "add", "--mailbox", mailbox, "--json"];
+    for (const flag of flags) {
+      assertSafeArg(flag, "flag");
+      args.push("--flag", flag);
+    }
+    const stdout = await this.pipeStdin(args, raw, account);
+    const id = (JSON.parse(stdout) as { id?: string | number }).id;
+    if (id === undefined) throw new Error(`message add returned no id: ${stdout.slice(0, 200)}`);
+    return String(id);
+  }
+
+  /**
+   * Run a himalaya command with `input` on stdin.
+   *
+   * Never retried: every caller writes (send, append), and a transient
+   * failure after the server acted would duplicate the message. stdin also
+   * keeps large messages clear of the kernel's per-argument limit.
+   */
+  private pipeStdin(args: string[], input: string, account?: string): Promise<string> {
     const acct = account || this.opts.account;
+    const argv = [...args];
     if (acct) {
       assertSafeArg(acct, "account");
-      args.push("--account", acct);
+      argv.push("--account", acct);
     }
-
     return new Promise((resolve, reject) => {
-      // spawn with an args array — no shell, no injection risk
-      const child = spawn(this.opts.binary, args, {
+      const child = spawn(this.opts.binary, argv, {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       });
-
       let stdout = "";
       let stderr = "";
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error(`himalaya ${args.slice(0, 2).join(" ")} timed out`));
+      }, this.opts.timeout);
       child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
       child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-
       child.on("close", (code: number | null) => {
-        if (code === 0) {
-          resolve(stdout);
-        } else {
-          reject(this.wrapError(new Error(`himalaya error: ${stderr || stdout}`)));
-        }
+        clearTimeout(timer);
+        if (code === 0) resolve(stdout);
+        else reject(this.wrapError(new Error(`himalaya error: ${stderr || stdout}`), acct));
       });
-
-      child.on("error", (err: Error) => reject(this.wrapError(err)));
-
-      child.stdin.write(template);
-      child.stdin.end();
-
-      setTimeout(() => {
-        child.kill();
-        reject(new Error("Send timed out"));
-      }, this.opts.timeout);
+      child.on("error", (err: Error) => {
+        clearTimeout(timer);
+        reject(this.wrapError(err, acct));
+      });
+      child.stdin.end(input);
     });
   }
 
@@ -463,6 +592,11 @@ export class HimalayaClient {
   async downloadAttachments(id: string, destDir: string, folder?: string, account?: string): Promise<string> {
     assertSafeArg(id, "id");
     assertSafeArg(destDir, "destDir");
+    if ((await this.resolveVersion()).major >= 2) {
+      const args = ["attachment", "download", id, "--dir", destDir];
+      const f = await this.applyFolderArg(args, folder);
+      return this.exec(args, { folder: f, account });
+    }
     const args = ["attachment", "download", "--downloads-dir", destDir, id];
     const f = await this.applyFolderArg(args, folder);
     return this.exec(args, { folder: f, account });
