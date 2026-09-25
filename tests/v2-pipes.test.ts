@@ -83,4 +83,15 @@ ${body}
     expect(argv()).toEqual(["attachment", "download", "9", "--dir", "/tmp/out", "--mailbox", "Archive", "--account", "work", "--json"]);
     expect(existsSync(join(dir, "calls"))).toBe(true);
   });
+
+  it("searchEnvelopes hands v2 the query verbatim, quotes included", async () => {
+    fake(`echo '{"envelopes":[]}'`);
+    const client = new HimalayaClient({ binary: bin, account: "work" });
+    await client.searchEnvelopes('subject "quarterly report" and not flag seen', "Archive");
+    expect(argv()).toEqual([
+      "envelope", "search", "--mailbox", "Archive", "--account", "work", "--json",
+      'subject "quarterly report" and not flag seen',
+    ]);
+  });
 });
+

@@ -240,9 +240,11 @@ export class HimalayaClient {
     const args = version.major >= 2 ? ["envelope", "search"] : ["envelope", "list"];
     const f = await this.applyFolderArg(args, folder);
     // Query words are positional args to himalaya (not a -q flag).
-    // Tokenize with quote awareness so `subject "meeting notes"` works,
-    // and refuse any token that would be parsed as a flag.
-    const tokens = tokenizeQuery(query);
+    // v2 joins them and parses the quoting itself, so the query goes through
+    // verbatim: stripping the quotes turned `subject "meeting notes"` into
+    // `subject meeting notes`, which v2 rejects. v1 still gets quote-aware
+    // tokens. Either way, refuse anything that would be parsed as a flag.
+    const tokens = version.major >= 2 ? [query.trim()] : tokenizeQuery(query);
     for (const token of tokens) {
       assertSafeArg(token, "query");
     }

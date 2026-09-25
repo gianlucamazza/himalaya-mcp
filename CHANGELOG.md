@@ -16,6 +16,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   - **Moves:** the source goes to `--from`, never `--mailbox`.
   - **Attachments:** `--dir`.
   v1 behaviour is unchanged.
+- **Multi-word search values failed on himalaya v2.** The query was split into tokens with the quotes stripped, so `subject "quarterly report"` reached v2 as `subject quarterly report`, which it rejects. v2 now receives the query verbatim as one argument; v1 keeps the tokenizer. The `search_emails` and `flag_email` descriptions, and the plugin's help and search skills, now describe the v2 grammar: no `before` (use `not after`), no bare words, and quoting.
+- **The compose tests depended on the himalaya installed on the machine.** They now pin the version like the other suites, so the suite passes with no himalaya on `PATH`, as in CI.
 - **`listAccounts` sent v2's `--json` to v1**, which rejects it. It now probes the version first.
 - **A missing binary surfaced as `himalaya_version_undetected`.** The version probe runs before every command, so it is where a missing binary shows first; it now reports `himalaya_not_installed`.
 - **`sendTemplate` left its timeout armed after every send.** Sending now goes through one stdin helper that clears it, and never retries, because a send or append that failed after the server acted would duplicate the message.

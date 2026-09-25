@@ -299,7 +299,7 @@ describe("HimalayaClient", () => {
 
       expect(mockExecFileAsync).toHaveBeenCalledWith(
         "himalaya",
-        expect.arrayContaining(["envelope", "search", "subject", "invoice"]),
+        expect.arrayContaining(["envelope", "search", "subject invoice"]),
         expect.any(Object),
       );
       const call = mockExecFileAsync.mock.calls.find((c) => (c[1] as string[])[0] === "envelope");
@@ -328,7 +328,7 @@ describe("HimalayaClient", () => {
       const argv = call![1] as string[];
       // The query DSL is a greedy positional on v2, so every flag must precede
       // the query tokens or clap swallows them.
-      expect(argv.indexOf("flag")).toBeGreaterThan(argv.indexOf("--json"));
+      expect(argv.indexOf("flag Flagged")).toBeGreaterThan(argv.indexOf("--json"));
     });
 
     it("readMessage passes id", async () => {
@@ -592,46 +592,62 @@ describe("HimalayaClient", () => {
     });
   });
 
-  describe("searchEnvelopes tokenizer", () => {
-    it("keeps a quoted multi-word value as one argv entry", async () => {
+  describe("searchEnvelopes query argv", () => {
+    const envelopeArgv = () =>
+      mockExecFileAsync.mock.calls.find((c) => (c[1] as string[])[0] === "envelope")![1] as string[];
+
+    // v2 joins the positional words and parses quoting itself: stripping the
+    // quotes turned `subject "meeting notes"` into `subject meeting notes`,
+    // which v2 rejects (verified against himalaya 2.1). So v2 gets the query
+    // verbatim, as one argv entry.
+    it("v2: passes the query verbatim, quotes included", async () => {
       setupMock("[]");
       const client = new HimalayaClient();
       await client.searchEnvelopes('subject "meeting notes"', "INBOX");
-
-      expect(mockExecFileAsync).toHaveBeenCalledWith(
-        "himalaya",
-        expect.arrayContaining(["envelope", "search", "subject", "meeting notes"]),
-        expect.any(Object),
-      );
+      expect(envelopeArgv().at(-1)).toBe('subject "meeting notes"');
     });
 
-    it("handles single quotes", async () => {
+    it("v2: text that looks like a flag stays inside the single query argument", async () => {
       setupMock("[]");
+      const client = new HimalayaClient();
+      await client.searchEnvelopes("subject foo --folder Trash", "INBOX");
+      const argv = envelopeArgv();
+      expect(argv.at(-1)).toBe("subject foo --folder Trash");
+      expect(argv.filter((a) => a === "--folder")).toHaveLength(0);
+    });
+
+    it("v2: rejects a query that itself starts with a dash", async () => {
+      setupMock("[]");
+      const client = new HimalayaClient();
+      await expect(client.searchEnvelopes("--account other", "INBOX")).rejects.toThrow(/looks like a flag/);
+    });
+
+    it("v1: keeps a quoted multi-word value as one argv entry", async () => {
+      configureMock({ version: V1_VERSION_STDOUT, stdout: "[]" });
+      const client = new HimalayaClient();
+      await client.searchEnvelopes('subject "meeting notes"', "INBOX");
+      expect(envelopeArgv()).toEqual(expect.arrayContaining(["envelope", "list", "subject", "meeting notes"]));
+    });
+
+    it("v1: handles single quotes", async () => {
+      configureMock({ version: V1_VERSION_STDOUT, stdout: "[]" });
       const client = new HimalayaClient();
       await client.searchEnvelopes("from 'foo bar@example.com'", "INBOX");
-
-      expect(mockExecFileAsync).toHaveBeenCalledWith(
-        "himalaya",
-        expect.arrayContaining(["envelope", "search", "from", "foo bar@example.com"]),
-        expect.any(Object),
-      );
+      expect(envelopeArgv()).toEqual(expect.arrayContaining(["from", "foo bar@example.com"]));
     });
 
-    it("collapses runs of whitespace", async () => {
-      setupMock("[]");
+    it("v1: collapses runs of whitespace", async () => {
+      configureMock({ version: V1_VERSION_STDOUT, stdout: "[]" });
       const client = new HimalayaClient();
       await client.searchEnvelopes("subject    invoice", "INBOX");
-
-      const call = mockExecFileAsync.mock.calls.find(
-        (c) => (c[1] as string[])[0] === "envelope",
-      );
-      const argv = call?.[1] as string[];
+      const argv = envelopeArgv();
       expect(argv.filter((a) => a === "")).toHaveLength(0);
       expect(argv).toContain("subject");
       expect(argv).toContain("invoice");
     });
 
-    it("rejects a query token that starts with a dash", async () => {
+    it("v1: rejects a query token that starts with a dash", async () => {
+      configureMock({ version: V1_VERSION_STDOUT, stdout: "[]" });
       const client = new HimalayaClient();
       await expect(
         client.searchEnvelopes("subject foo --folder Trash", "INBOX"),
